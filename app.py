@@ -63,7 +63,22 @@ _EXCLUDE_COLS = {
     "P_emaildomain", "R_emaildomain",
     "M4", "M6", "DeviceType", "id_30", "id_31", "DeviceInfo", "id_33",
 }
-
+FEATURE_COLS_ORDER = [
+    'TransactionID', 'TransactionDT', 'TransactionAmt',
+    'card1', 'card2', 'card3', 'card5',
+    'addr1', 'addr2', 'dist1',
+    'C1', 'C2', 'C6', 'C11', 'C13', 'C14',
+    'D1', 'D10', 'D15',
+    'ProductCD_freq', 'card4_freq', 'card6_freq',
+    'P_emaildomain_freq', 'R_emaildomain_freq',
+    'M4_freq', 'M6_freq', 'id_30_freq', 'id_31_freq', 'DeviceType_freq',
+    # Thêm các V-cols:
+    'V1', 'V3', 'V4', 'V6', 'V8', 'V11', 'V13', 'V14', 'V17', 'V20', 'V23', 'V26', 'V27', 'V30',
+    'V36', 'V37', 'V40', 'V41', 'V44', 'V47', 'V48', 'V54', 'V56', 'V59', 'V62', 'V65', 'V67', 'V68', 'V70',
+    'V76', 'V78', 'V80', 'V82', 'V86', 'V88', 'V89', 'V91', 'V107', 'V108', 'V111', 'V115', 'V117', 'V120', 'V121', 'V123',
+    'V124', 'V127', 'V129', 'V130', 'V136', 'V281', 'V283', 'V284', 'V285', 'V286', 'V289', 'V291', 'V294', 'V296',
+    'V297', 'V301', 'V303', 'V305', 'V307', 'V309', 'V310', 'V314', 'V320'
+]
 # ─── LOAD ARTIFACTS ──────────────────────────────────────────────────────────
 @st.cache_resource
 def load_model(model_path: str):
@@ -157,11 +172,6 @@ def run_full_pipeline(
     freq_maps: dict,
     booster: xgb.Booster,
 ) -> pd.DataFrame:
-    """
-    BUG FIX CHÍNH: Không dùng FEATURE_COLS_ORDER hardcode.
-    Lấy feature_names trực tiếp từ booster (đúng thứ tự lúc train),
-    rồi select + reindex để align chính xác.
-    """
     df = add_uid(df)
     df = apply_uid_agg(df, uid_agg)
     df = apply_freq_encoding(df, freq_maps)
@@ -169,32 +179,25 @@ def run_full_pipeline(
 
     # Lấy feature names từ booster — source of truth duy nhất
     feature_names = booster.feature_names  # có thể là None nếu model train không set names
+    for col in FEATURE_COLS_ORDER:
+        if col not in df.columns:
+            df[col] = np.nan
 
-    if feature_names is not None:
-        # Happy path: booster biết tên features → align chính xác
-        for col in feature_names:
-            if col not in df.columns:
-                df[col] = np.nan
-        X = df[feature_names].astype(np.float32)
-    else:
-        # Fallback: booster không có feature names (train bằng numpy array thuần)
-        # → loại các cột non-numeric và exclude cols, giữ nguyên thứ tự như notebook
-        numeric_cols = [
-            c for c in df.columns
-            if c not in _EXCLUDE_COLS
-            and pd.api.types.is_numeric_dtype(df[c])
-        ]
-        X = df[numeric_cols].astype(np.float32)
+    X = df[FEATURE_COLS_ORDER].astype(np.float32)
+  
 
     return X
 
 
 def predict(booster: xgb.Booster, X: pd.DataFrame) -> np.ndarray:
     if booster.feature_names is not None:
-        # Model có feature names → truyền vào để XGBoost validate thứ tự
+        st.write("X.columns:", list(X.columns))
+        st.write("booster.feature_names:", booster.feature_names)
+        print("X.columns:", list(X.columns))
+        print("booster.feature_names:", booster.feature_names)
+        
         dmat = xgb.DMatrix(X, feature_names=list(X.columns))
     else:
-        # Model train bằng numpy thuần, không có feature names → truyền array
         dmat = xgb.DMatrix(X.values)
     return booster.predict(dmat)
 
@@ -238,15 +241,15 @@ with st.sidebar:
 
     model_path = st.text_input(
         "XGBoost model path",
-        value="./best_xgb_model/best_booster.ubj",
+        value="./best_xgb_model/best_booster_sample.ubj",
     )
     uid_agg_path = st.text_input(
         "uid_agg path",
-        value="./artifacts/uid_agg.parquet",
+        value="./artifacts/uid_agg_sample.parquet",
     )
     freq_maps_path = st.text_input(
         "freq_maps path",
-        value="./artifacts/freq_maps.pkl",
+        value="./artifacts/freq_maps_sample.pkl",
     )
     threshold = st.slider(
         "Fraud threshold", min_value=0.1, max_value=0.9,
@@ -297,6 +300,7 @@ with st.sidebar:
         with st.expander(f"📋 Feature names ({n_feat})"):
             if fn:
                 st.text('\n'.join(fn))
+                st.write(fn)
             else:
                 st.info(f"Model có {n_feat} features nhưng không lưu tên (trained without feature names).")
 
@@ -310,10 +314,9 @@ subsample    : 0.8
 colsample    : 0.8
 scale_pos_wt : ~6.2
 split        : time-based
-    """, language="text")
+""", language="text")
 
 
-# ─── TABS ─────────────────────────────────────────────────────────────────────
 tab_predict, tab_batch, tab_eda = st.tabs([
     "🔮 Predict Transaction",
     "📋 Batch Scoring",
@@ -441,9 +444,6 @@ with tab_predict:
             st.markdown(f"- {f}")
 
 
-# ═══════════════════════════════════════════════════════════════════
-# TAB 2 — BATCH SCORING
-# ═══════════════════════════════════════════════════════════════════
 with tab_batch:
     st.markdown("## 📋 Batch Scoring")
     st.markdown(
@@ -530,10 +530,6 @@ with tab_batch:
                     import traceback
                     st.code(traceback.format_exc())
 
-
-# ═══════════════════════════════════════════════════════════════════
-# TAB 3 — EDA (giữ nguyên, không liên quan bug)
-# ═══════════════════════════════════════════════════════════════════
 def plot_label_dist(df: pd.DataFrame) -> go.Figure:
     counts = df['isFraud'].value_counts().reset_index()
     counts.columns = ['isFraud', 'count']
