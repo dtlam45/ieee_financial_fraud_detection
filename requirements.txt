@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+xgboost
+plotly
+streamlit-option-menu
+streamlit-authenticator
+pyyaml
+pyvis
+pyarrow
