@@ -1,0 +1,19 @@
+credentials:
+  usernames:
+    admin:
+      email: admin@sentinel.ai
+      failed_login_attempts: 0
+      first_name: Sentinel
+      last_name: Admin
+      logged_in: false
+      password: "0"
+      roles:
+      - admin
+      - analyst
+cookie:
+  expiry_days: 30
+  key: sentinel_signature_key
+  name: sentinel_cookie
+pre-authorized:
+  emails:
+  - admin@sentinel.ai

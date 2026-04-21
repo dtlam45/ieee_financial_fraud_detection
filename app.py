@@ -12,18 +12,68 @@ import numpy as np
 import xgboost as xgb
 import plotly.express as px
 import plotly.graph_objects as go
+from datetime import datetime
 from plotly.subplots import make_subplots
+from streamlit_option_menu import option_menu
 import pickle
 import os
+import yaml
+from db import save_case, get_all_cases, update_case_status, get_case_by_id, get_related_cases
+from yaml.loader import SafeLoader
+from streamlit_authenticator import Authenticate
+from pyvis.network import Network
+import streamlit.components.v1 as components
 
 
 st.set_page_config(
-    page_title="IEEE Financial Fraud Detection - Team ",
-    page_icon="",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
+# ─── INITIALIZE GLOBAL STATE ────────────────────────────────────────────────
+if 'threshold' not in st.session_state:
+    st.session_state['threshold'] = 0.5
+
+# ─── INITIALIZE GLOBAL STATE ────────────────────────────────────────────────
+if 'threshold' not in st.session_state:
+    st.session_state['threshold'] = 0.5
+
+# ─── LOAD AUTHENTICATION CONFIG ──────────────────────────────────────────────
+with open('auth_config.yaml') as file:
+    config = yaml.load(file, Loader=SafeLoader)
+
+authenticator = Authenticate(
+    config['credentials'],
+    config['cookie']['name'],
+    config['cookie']['key'],
+    config['cookie']['expiry_days'],
+    auto_hash=True # Allows you to type plain text password directly in YAML
+)
+
+try:
+    authenticator.login(
+        location='main',
+        fields={
+            'Form name': 'Sentinel Intel - Fraud Detection', 
+            'Username': 'Username', 
+            'Password': 'Password', 
+            'Login': 'Login'
+        }
+    )
+except Exception as e:
+    st.error(f"Auth System Error: {e}")
+
+# ─── LOGIC CHECK LOGIN ──────────────────────────────────────────────────────
+if st.session_state["authentication_status"] is False:
+    st.error('Incorrect username or password. Please try again.')
+    st.stop()
+elif st.session_state["authentication_status"] is None:
+    # Không hiện warning gây khó chịu, chỉ hiện thông tin hướng dẫn
+    st.info('Please login to access the Fraud Detection system.')
+    st.stop()
+
+
+# ─── THEME & STYLE SETTINGS ──────────────────────────────────────────────────
 st.markdown("""
 <style>
   [data-testid="stAppViewContainer"] { background: #0d1117; }
@@ -49,6 +99,7 @@ st.markdown("""
     font-family: monospace; font-weight: bold; font-size: 18px;
   }
   .stProgress > div > div { background: #3fb950; }
+  
 </style>
 """, unsafe_allow_html=True)
 
@@ -118,11 +169,25 @@ def add_uid(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def apply_uid_agg(df: pd.DataFrame, uid_agg: pd.DataFrame) -> pd.DataFrame:
-    # BUG FIX: drop cột trùng trước khi merge để tránh suffix _x _y
+    # BUG FIX: drop cột trùng trước khi merge và xử lý fillna thông minh
     uid_cols = [c for c in uid_agg.columns if c != 'uid']
     df = df.drop(columns=[c for c in uid_cols if c in df.columns], errors='ignore')
     df = df.merge(uid_agg, on='uid', how='left')
-    df['uid_amt_std'] = df['uid_amt_std'].fillna(0.0)
+    
+    # KIỂM TRA TOÀN VẸN: Chỉ fillna nếu cột tồn tại trong database nạp vào
+    # Giúp ứng dụng không bị crash khi dùng các model/data schema khác nhau
+    if 'uid_amt_mean' in df.columns:
+        df['uid_amt_mean'] = df['uid_amt_mean'].fillna(df['TransactionAmt'])
+    
+    if 'uid_amt_std' in df.columns:
+        df['uid_amt_std'] = df['uid_amt_std'].fillna(20.0)
+    
+    if 'uid_C1_mean' in df.columns:
+        df['uid_C1_mean'] = df['uid_C1_mean'].fillna(1.0)
+        
+    if 'uid_D1_mean' in df.columns:
+        df['uid_D1_mean'] = df['uid_D1_mean'].fillna(10.0)
+        
     return df
 
 
@@ -148,8 +213,8 @@ def apply_freq_encoding(df: pd.DataFrame, freq_maps: dict) -> pd.DataFrame:
         )
         df[freq_col] = df[freq_col].fillna(0)
 
-        # Khôi phục NaN cho categorical gốc
-        df[col_name] = df[col_name].replace({'nan': np.nan, 'None': np.nan, '': np.nan})
+        # Khôi phục NaN cho categorical gốc - Sửa lỗi FutureWarning
+        df[col_name] = df[col_name].replace({'nan': np.nan, 'None': np.nan, '': np.nan}).infer_objects(copy=False)
     return df
 
 
@@ -177,26 +242,27 @@ def run_full_pipeline(
     df = apply_freq_encoding(df, freq_maps)
     df = add_extra_features(df)
 
-    # Lấy feature names từ booster — source of truth duy nhất
-    feature_names = booster.feature_names  # có thể là None nếu model train không set names
-    for col in FEATURE_COLS_ORDER:
+    # Đảm bảo đồng bộ đặc trưng
+    features = booster.feature_names if booster.feature_names else FEATURE_COLS_ORDER
+    
+    # Xử lý các cột Categorical còn sót lại (chưa được freq encoded)
+    for col in features:
         if col not in df.columns:
             df[col] = np.nan
 
-    X = df[FEATURE_COLS_ORDER].astype(np.float32)
+        # Nếu cột vẫn là dạng chuỗi (Object), mã hóa nó thành số để model hiểu
+        if df[col].dtype == 'object' or df[col].dtype.name == 'category':
+            df[col] = pd.factorize(df[col].astype(str))[0].astype(np.float32)
   
-
+    # Trích xuất và ép kiểu an toàn
+    X = df[features].apply(pd.to_numeric, errors='coerce').astype(np.float32)
     return X
 
 
 def predict(booster: xgb.Booster, X: pd.DataFrame) -> np.ndarray:
+    """Thực hiện dự báo an toàn"""
     if booster.feature_names is not None:
-        st.write("X.columns:", list(X.columns))
-        st.write("booster.feature_names:", booster.feature_names)
-        print("X.columns:", list(X.columns))
-        print("booster.feature_names:", booster.feature_names)
-        
-        dmat = xgb.DMatrix(X, feature_names=list(X.columns))
+        dmat = xgb.DMatrix(X[booster.feature_names])
     else:
         dmat = xgb.DMatrix(X.values)
     return booster.predict(dmat)
@@ -231,100 +297,216 @@ def demo_predict(row: dict) -> float:
     score += (np.random.rand() - 0.5) * 0.03
     return float(np.clip(score, 0.01, 0.97))
 
-
-with st.sidebar:
-    st.markdown("## Team LHAL")
-    st.markdown("**IEEE-CIS Financial Fraud Detection**")
-    st.markdown("---")
-
-    st.markdown("### 📂 Load Artifacts")
-
-    model_path = st.text_input(
-        "XGBoost model path",
-        value="./best_xgb_model/best_booster_sample.ubj",
+def plot_label_dist(df: pd.DataFrame) -> go.Figure:
+    counts = df['isFraud'].value_counts().reset_index()
+    counts.columns = ['isFraud', 'count']
+    counts['label'] = counts['isFraud'].map({0: 'Legit', 1: 'Fraud'})
+    fig = px.pie(
+        counts, values='count', names='label',
+        color='label',
+        color_discrete_map={'Legit': '#3fb950', 'Fraud': '#f85149'},
+        hole=0.45, title='Label Distribution',
     )
-    uid_agg_path = st.text_input(
-        "uid_agg path",
-        value="./artifacts/uid_agg_sample.parquet",
+    fig.update_layout(paper_bgcolor='#0d1117', plot_bgcolor='#0d1117',
+                      font_color='#c9d1d9', title_font_size=14,
+                      legend=dict(font_color='#c9d1d9'))
+    return fig
+
+def plot_amt_distribution(df: pd.DataFrame) -> go.Figure:
+    sample = df[['TransactionAmt', 'isFraud']].dropna().sample(
+        min(len(df), 20000), random_state=42)
+    sample['log_amt'] = np.log1p(sample['TransactionAmt'])
+    fig = make_subplots(rows=1, cols=2,
+                        subplot_titles=['log(TransactionAmt+1) by Label', 'Boxplot by Label'])
+    colors = {0: '#3fb950', 1: '#f85149'}
+    labels = {0: 'Legit', 1: 'Fraud'}
+    for label in [0, 1]:
+        sub = sample[sample['isFraud'] == label]['log_amt']
+        fig.add_trace(go.Histogram(x=sub, name=labels[label], marker_color=colors[label],
+                                   opacity=0.6, nbinsx=60, histnorm='probability density'),
+                      row=1, col=1)
+        fig.add_trace(go.Box(y=sub, name=labels[label], marker_color=colors[label],
+                             boxmean=True), row=1, col=2)
+    fig.update_layout(paper_bgcolor='#0d1117', plot_bgcolor='#161b22',
+                      font_color='#c9d1d9', title_text='Transaction Amount Analysis',
+                      barmode='overlay', height=380)
+    return fig
+
+def plot_fraud_rate_by_cat(df: pd.DataFrame, col: str) -> go.Figure:
+    agg = (df.groupby(col)['isFraud'].agg(['mean', 'count']).reset_index()
+           .rename(columns={'mean': 'fraud_rate', 'count': 'total'}))
+    agg['fraud_rate_pct'] = (agg['fraud_rate'] * 100).round(2)
+    agg = agg.sort_values('fraud_rate_pct', ascending=False).head(15)
+    fig = px.bar(agg, x=col, y='fraud_rate_pct', text='fraud_rate_pct',
+                 color='fraud_rate_pct',
+                 color_continuous_scale=['#3fb950', '#d2993a', '#f85149'],
+                 title=f'Fraud Rate (%) by {col}',
+                 labels={'fraud_rate_pct': 'Fraud Rate (%)'})
+    fig.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+    fig.update_layout(paper_bgcolor='#0d1117', plot_bgcolor='#161b22',
+                      font_color='#c9d1d9', coloraxis_showscale=False,
+                      height=380, title_font_size=14)
+    return fig
+    
+def plot_correlation_heatmap(df: pd.DataFrame) -> go.Figure:
+    num_cols  = ['TransactionAmt', 'C1', 'C2', 'C6', 'C11', 'C13',
+                 'D1', 'D4', 'D10', 'card1', 'addr1', 'isFraud']
+    available = [c for c in num_cols if c in df.columns]
+    corr = df[available].corr(numeric_only=True)
+    fig  = go.Figure(go.Heatmap(z=corr.values, x=corr.columns.tolist(),
+                                y=corr.index.tolist(), colorscale='RdBu', zmid=0,
+                                text=np.round(corr.values, 2), texttemplate='%{text}',
+                                textfont_size=9))
+    fig.update_layout(title='Feature Correlation Matrix', paper_bgcolor='#0d1117',
+                      plot_bgcolor='#0d1117', font_color='#c9d1d9', height=420)
+    return fig
+
+
+def plot_hourly_fraud(df: pd.DataFrame) -> go.Figure:
+    if 'tx_hour' not in df.columns:
+        df = df.copy()
+        df['tx_hour'] = ((df.get('TransactionDT', 0) / 3600) % 24).astype(int)
+    agg = df.groupby('tx_hour')['isFraud'].agg(['mean', 'count']).reset_index()
+    agg['fraud_rate_pct'] = (agg['mean'] * 100).round(2)
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Bar(x=agg['tx_hour'], y=agg['count'], name='Total Transactions',
+                         marker_color='#1f6feb', opacity=0.5), secondary_y=False)
+    fig.add_trace(go.Scatter(x=agg['tx_hour'], y=agg['fraud_rate_pct'],
+                             name='Fraud Rate (%)', mode='lines+markers',
+                             line=dict(color='#f85149', width=2), marker=dict(size=6)),
+                  secondary_y=True)
+    fig.update_layout(title='Fraud Rate & Volume by Hour of Day', paper_bgcolor='#0d1117',
+                      plot_bgcolor='#161b22', font_color='#c9d1d9', height=360)
+    fig.update_yaxes(title_text='Transaction Count', secondary_y=False)
+    fig.update_yaxes(title_text='Fraud Rate (%)', secondary_y=True)
+    return fig
+
+
+# ─── SIDEBAR NAVIGATION & ASSET MANAGEMENT ──────────────────────────────────
+with st.sidebar:    
+    # Navigation
+    page = option_menu(
+        menu_title=None, 
+        options=["Dashboard", "Predict", "Investigation Center", "Batch Scoring", "EDA Analytics", "Settings"],
+        icons=["speedometer2", "lightning-charge", "shield-check", "layers-half", "bar-chart-steps", "gear"],
+        menu_icon="cast", 
+        default_index=0,
+        styles={
+            "container": {"padding": "0!important", "background-color": "#161b22"},
+            "icon": {"color": "#58a6ff", "font-size": "18px"}, 
+            "nav-link": {"font-size": "14px", "text-align": "left", "margin":"0px", "--hover-color": "#21262d"},
+            "nav-link-selected": {"background-color": "#238636"},
+        }
     )
-    freq_maps_path = st.text_input(
-        "freq_maps path",
-        value="./artifacts/freq_maps_sample.pkl",
-    )
-    threshold = st.slider(
-        "Fraud threshold", min_value=0.1, max_value=0.9,
-        value=0.5, step=0.05,
-    )
 
-    if st.button("🔄 Load Model", use_container_width=True):
-        if os.path.exists(model_path):
-            try:
-                st.session_state['booster'] = load_model(model_path)
-                fn = st.session_state['booster'].feature_names or []
-                n_feat = len(fn) if fn else st.session_state['booster'].num_features()
-                st.success(f"Model loaded! ({n_feat} features)")
-            except Exception as e:
-                st.error(f"{e}")
-                st.session_state['booster'] = None
-        else:
-            st.warning("⚠ Model file not found. Using demo mode.")
-            st.session_state['booster'] = None
+    st.write("---")
+    # 🚪 Official Logout Widget
+    authenticator.logout('Logout', 'sidebar')
+    st.write("---")
 
-        if os.path.exists(uid_agg_path):
-            st.session_state['uid_agg'] = load_uid_agg(uid_agg_path)
-            st.success(f"uid_agg loaded! ({len(st.session_state['uid_agg']):,} UIDs)")
-        else:
-            st.session_state['uid_agg'] = None
-            st.warning("uid_agg not found")
+# ─── MAIN CONTENT ROUTING ──────────────────────────────────────────────────
 
-        if os.path.exists(freq_maps_path):
-            st.session_state['freq_maps'] = load_freq_maps(freq_maps_path)
-            st.success(f"freq_maps loaded! ({len(st.session_state['freq_maps'])} cols)")
-        else:
-            st.session_state['freq_maps'] = None
-            st.warning("freq_maps not found")
+if page == "Dashboard":
+    st.markdown("# Executive Fraud Dashboard")
+    st.markdown("Real-time risk insights from aggregated transaction history.")
+    
+    # Load data for dashboard
+    uid_df = st.session_state.get('uid_agg')
+    if uid_df is None and os.path.exists("./artifacts/uid_agg_sample.parquet"):
+        uid_df = load_uid_agg("./artifacts/uid_agg_sample.parquet")
+        st.session_state['uid_agg'] = uid_df
 
-    st.markdown("---")
-    st.markdown("### ⚙️ Pipeline Status")
-    booster_ok = st.session_state.get('booster') is not None
-    uid_ok     = st.session_state.get('uid_agg') is not None
-    freq_ok    = st.session_state.get('freq_maps') is not None
+    if uid_df is not None:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Transactions", f"{uid_df['uid_tx_count'].sum():,}", "+5.2%")
+        c2.metric("Tracked Entities", f"{len(uid_df):,}", "+1.8%")
+        c3.metric("Avg Exposure", f"${uid_df['uid_amt_mean'].mean():.2f}", "-0.4%")
+        c4.metric("High Risk Users", f"{len(uid_df[uid_df['uid_amt_mean'] > 500]):,}", "Critical")
+        
+        st.write("---")
+        
+        col_left, col_right = st.columns(2)
+        with col_left:
+            fig_vol = px.histogram(uid_df, x='uid_tx_count', title="User Activity Distribution (Volume)", 
+                                   template="plotly_dark", color_discrete_sequence=['#2563eb'])
+            st.plotly_chart(fig_vol, use_container_width=True) # width='stretch' in new API
+            
+        with col_right:
+            fig_amt = px.box(uid_df, y='uid_amt_mean', title="Transaction Amount Spread per UID", 
+                             template="plotly_dark", color_discrete_sequence=['#f85149'])
+            st.plotly_chart(fig_amt, use_container_width=True)
+    else:
+        st.warning("Please sync 'UID Agg' in the sidebar to view Dashboard stats.")
 
-    st.markdown(f"{'🟢' if booster_ok else '🔴'} XGBoost Booster")
-    st.markdown(f"{'🟢' if uid_ok else '🟡'} uid_agg (optional)")
-    st.markdown(f"{'🟢' if freq_ok else '🟡'} freq_maps (optional)")
+elif page == "Investigation Center":
+    st.markdown("# 🛡️ Investigation Center")
+    st.markdown("Manage and update the status of suspicious fraud cases.")
 
-    if booster_ok:
-        fn = st.session_state['booster'].feature_names or []
-        n_feat = len(fn) if fn else st.session_state['booster'].num_features()
-        with st.expander(f"📋 Feature names ({n_feat})"):
-            if fn:
-                st.text('\n'.join(fn))
-                st.write(fn)
-            else:
-                st.info(f"Model có {n_feat} features nhưng không lưu tên (trained without feature names).")
+    df_cases = get_all_cases()
+    
+    if df_cases.empty:
+        st.info("No files have been recorded yet. Please run the prediction on the 'Predict' page to start.")
+    else:
+        # Statistics
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Cases", len(df_cases))
+        c2.metric("❌ Fraud", len(df_cases[df_cases['status'] == 'Confirmed Fraud']))
+        c3.metric("✅ Legit", len(df_cases[df_cases['status'] == 'Confirmed Legit']))
+        c4.metric("⏳ Pending", len(df_cases[df_cases['status'] == 'Pending']))
 
-    st.markdown("---")
-    st.markdown("### 📖 Model Config")
-    st.code("""
-n_estimators : 500
-max_depth    : 6
-learning_rate: 0.05
-subsample    : 0.8
-colsample    : 0.8
-scale_pos_wt : ~6.2
-split        : time-based
-""", language="text")
+        st.write("---")
+        
+        # Dashboard Table with Status Update
+        st.markdown("### List of files")
+        
+        status_filter = st.multiselect(
+            "Filter by status", 
+            ['Pending', 'Confirmed Fraud', 'Confirmed Legit', 'In Review'], 
+            default=['Pending', 'In Review']
+        )
+        
+        filtered_df = df_cases[df_cases['status'].isin(status_filter)]
+        
+        st.dataframe(
+            filtered_df,
+            use_container_width=True,
+            column_config={
+                "id": "#ID",
+                "probability": st.column_config.ProgressColumn("Xác suất Fraud", min_value=0, max_value=1),
+                "created_at": "Thời gian tạo",
+                "status": "Trạng thái",
+            }
+        )
 
+        # 🚀 EXPORT DASHBOARD AS REPORT
+        st.write("")
+        csv_data = filtered_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="⬇️ Download Investigation Report (CSV)",
+            data=csv_data,
+            file_name=f"sentinel_investigation_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime='text/csv',
+            use_container_width=True,
+            type="secondary",
+            help="Xuất danh sách các hồ sơ đang hiển thị trong bộ lọc hiện tại."
+        )
 
-tab_predict, tab_batch, tab_eda = st.tabs([
-    "🔮 Predict Transaction",
-    "📋 Batch Scoring",
-    "📊 EDA",
-])
-
-with tab_predict:
-    st.markdown("## 🔮 Single Transaction Scoring")
+        st.write("---")
+        st.markdown("### Update profile status")
+        with st.form("update_case_form"):
+            case_id_to_up = st.number_input("Select the profile ID that needs updating.", min_value=1, step=1)
+            new_status = st.selectbox("New status", ['Confirmed Fraud', 'Confirmed Legit', 'In Review', 'Resolved'])
+            new_notes = st.text_area("Investigation notes")
+            
+            if st.form_submit_button("Update profile"):
+                if case_id_to_up in df_cases['id'].values:
+                    update_case_status(case_id_to_up, new_status, new_notes)
+                    st.success(f"Updated profile #{case_id_to_up} to {new_status}!")
+                    st.rerun()
+                else:
+                    st.error("Profile ID not found.")
+elif page == "Predict":
+    st.markdown("## Single Transaction Scoring")
 
     col1, col2, col3 = st.columns(3)
 
@@ -332,8 +514,8 @@ with tab_predict:
         st.markdown("**💳 Transaction Info**")
         tx_amt     = st.number_input("TransactionAmt ($)", min_value=0.01, value=125.50, step=0.01)
         product_cd = st.selectbox("ProductCD", ['W', 'H', 'C', 'S', 'R'])
-        card4      = st.selectbox("card4 (Network)", ['visa', 'mastercard', 'discover', 'american express'])
-        card6      = st.selectbox("card6 (Type)", ['debit', 'credit', 'charge card'])
+        card4      = st.selectbox("Card Network", ['visa', 'mastercard', 'discover', 'american express'])
+        card6      = st.selectbox("Card Type", ['debit', 'credit', 'charge card'])
         p_email    = st.selectbox("P_emaildomain", [
             'gmail.com', 'yahoo.com', 'hotmail.com',
             'anonymous.com', 'protonmail.com', 'unknown.xyz', 'other'
@@ -341,22 +523,23 @@ with tab_predict:
 
     with col2:
         st.markdown("**🏦 Card & Address**")
-        card1 = st.number_input("card1 (Bank ID)", min_value=0, max_value=20000, value=9500)
-        card2 = st.number_input("card2", min_value=0, max_value=1000, value=321)
-        card3 = st.number_input("card3", min_value=0, max_value=200, value=150)
-        card5 = st.number_input("card5", min_value=0, max_value=300, value=226)
-        addr1 = st.number_input("addr1 (Billing Zip)", min_value=0, max_value=500, value=299)
-        addr2 = st.number_input("addr2", min_value=0, max_value=100, value=87)
+        card1 = st.number_input("Bank ID", min_value=0, max_value=20000, value=9500)
+        card2 = st.number_input("Branch ID", min_value=0, max_value=1000, value=321)
+        card3 = st.number_input("Country ID", min_value=0, max_value=200, value=150)
+        card5 = st.number_input("Category ID", min_value=0, max_value=300, value=226)
+        addr1 = st.number_input("Billing Zip", min_value=0, max_value=500, value=299)
+        addr2 = st.number_input("Billing Country", min_value=0, max_value=100, value=87)
 
     with col3:
         st.markdown("**📐 Behavioral Features**")
-        c1    = st.number_input("C1 (Count)", min_value=0, max_value=2000, value=1)
-        c2    = st.number_input("C2", min_value=0, max_value=5000, value=1)
-        d1    = st.number_input("D1 (Days since first tx)", min_value=0.0, max_value=600.0, value=14.0)
-        d10   = st.number_input("D10", min_value=0.0, max_value=600.0, value=10.0)
+        c1    = st.number_input("Address/Email Count", min_value=0, max_value=2000, value=1)
+        c2    = st.number_input("Card Usage Count", min_value=0, max_value=5000, value=1)
+        d1    = st.number_input("Account Age (Days)", min_value=0.0, max_value=600.0, value=14.0)
+        d10   = st.number_input("Days Since Last Activity", min_value=0.0, max_value=600.0, value=10.0)
         tx_dt = st.number_input("TransactionDT (seconds)", min_value=0, value=86400 * 10)
         device = st.selectbox("DeviceType", ['desktop', 'mobile'])
-
+    
+    threshold = st.session_state['threshold']
     if st.button("⚡ Run Prediction", use_container_width=True, type="primary"):
         tx_hour   = int((tx_dt / 3600) % 24)
         input_row = {
@@ -399,6 +582,25 @@ with tab_predict:
                 else:
                     prob       = demo_predict({**input_row, 'P_emaildomain': p_email, 'tx_hour': tx_hour})
                     mode_label = "Demo Mode (heuristic)"
+                
+                # ── AUTOMATIC SAVE TO INVESTIGATION ──
+                if prob >= threshold:
+                    # Generate a fake but unique TransactionID for single predict
+                    txn_id = f"SING-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                    investigator = st.session_state.get("username", "System")
+                    label = "Fraud" if prob >= threshold else "Legit" # though here it's always >= threshold
+                    
+                    saved = save_case(
+                        transaction_id=txn_id,
+                        probability=prob,
+                        prediction_label=label,
+                        card1=card1,
+                        addr1=addr1,
+                        email=p_email,
+                        investigator=investigator
+                    )
+                    if saved:
+                        st.toast(f"🚨 Fraud case logged: {txn_id}", icon="🛡️")
             except Exception as e:
                 st.error(f"Pipeline error: {e}")
                 import traceback; st.code(traceback.format_exc())
@@ -444,16 +646,16 @@ with tab_predict:
             st.markdown(f"- {f}")
 
 
-with tab_batch:
-    st.markdown("## 📋 Batch Scoring")
+elif page == "Batch Scoring":
+    st.markdown("## Batch Scoring")
     st.markdown(
-        "Upload file CSV (cùng format với `test_transaction.csv` của IEEE-CIS). "
-        "App sẽ chạy **đúng** pipeline như notebook và trả về fraud probability."
+        "Upload the CSV file (in the same format as IEEE-CIS's `test_transaction.csv`)."
+        "The app will run the **correct** pipeline as in the notebook and return a fraud probability."
     )
 
     uploaded = st.file_uploader(
         "Upload transaction CSV", type=["csv"],
-        help="Cần có ít nhất: TransactionID, TransactionAmt, card1, addr1, D1, TransactionDT"
+        help="Must contain at least: TransactionID, TransactionAmt, card1, addr1, D1, TransactionDT"
     )
 
     if uploaded:
@@ -463,7 +665,7 @@ with tab_batch:
         with st.expander("Preview data"):
             st.dataframe(df_up.head(10))
 
-        if st.button("Score Batch", use_container_width=True, type="primary"):
+        if st.button("🚀 Score Batch", use_container_width=True, type="primary"):
             booster   = st.session_state.get('booster')
             uid_agg   = st.session_state.get('uid_agg')
             freq_maps = st.session_state.get('freq_maps')
@@ -484,13 +686,37 @@ with tab_batch:
                             if i % max(1, len(df_up) // 20) == 0:
                                 prog.progress(min(i / len(df_up), 1.0))
                         probs = np.array(probs)
-                        st.info("⚠ Demo mode — load artifacts để dùng model thật")
+                        st.info("⚠ Demo mode — load artifacts to use the real model")
 
                     id_col    = 'TransactionID' if 'TransactionID' in df_up.columns else df_up.columns[0]
                     df_result = df_up[[id_col]].copy()
+                    threshold = st.session_state['threshold']
                     df_result['fraud_probability'] = np.round(probs, 4)
                     df_result['prediction']        = (probs >= threshold).astype(int)
                     df_result['label']             = df_result['prediction'].map({0: 'Legit', 1: 'Fraud'})
+
+                    # ── AUTOMATIC SAVE BATCH FRAUD CASES ──
+                    fraud_rows = df_result[df_result['prediction'] == 1]
+                    investigator = st.session_state.get("username", "System")
+                    
+                    new_logs_count = 0
+                    for index, row in fraud_rows.iterrows():
+                        # Lấy thêm thông tin từ df_up gốc để lưu
+                        orig_row = df_up.iloc[index]
+                        saved = save_case(
+                            transaction_id=row[id_col],
+                            probability=row['fraud_probability'],
+                            prediction_label="Fraud",
+                            card1=orig_row.get('card1', ''),
+                            addr1=orig_row.get('addr1', ''),
+                            email=orig_row.get('P_emaildomain', ''),
+                            investigator=investigator
+                        )
+                        if saved: new_logs_count += 1
+                        
+                    if new_logs_count > 0:
+                        st.toast(f"✅ Logged {new_logs_count} new fraud cases to Investigation Center", icon="🛡️")
+
 
                     n_fraud = int((probs >= threshold).sum())
                     m1, m2, m3, m4 = st.columns(4)
@@ -530,95 +756,7 @@ with tab_batch:
                     import traceback
                     st.code(traceback.format_exc())
 
-def plot_label_dist(df: pd.DataFrame) -> go.Figure:
-    counts = df['isFraud'].value_counts().reset_index()
-    counts.columns = ['isFraud', 'count']
-    counts['label'] = counts['isFraud'].map({0: 'Legit', 1: 'Fraud'})
-    fig = px.pie(
-        counts, values='count', names='label',
-        color='label',
-        color_discrete_map={'Legit': '#3fb950', 'Fraud': '#f85149'},
-        hole=0.45, title='Label Distribution',
-    )
-    fig.update_layout(paper_bgcolor='#0d1117', plot_bgcolor='#0d1117',
-                      font_color='#c9d1d9', title_font_size=14,
-                      legend=dict(font_color='#c9d1d9'))
-    return fig
-
-
-def plot_amt_distribution(df: pd.DataFrame) -> go.Figure:
-    sample = df[['TransactionAmt', 'isFraud']].dropna().sample(
-        min(len(df), 20000), random_state=42)
-    sample['log_amt'] = np.log1p(sample['TransactionAmt'])
-    fig = make_subplots(rows=1, cols=2,
-                        subplot_titles=['log(TransactionAmt+1) by Label', 'Boxplot by Label'])
-    colors = {0: '#3fb950', 1: '#f85149'}
-    labels = {0: 'Legit', 1: 'Fraud'}
-    for label in [0, 1]:
-        sub = sample[sample['isFraud'] == label]['log_amt']
-        fig.add_trace(go.Histogram(x=sub, name=labels[label], marker_color=colors[label],
-                                   opacity=0.6, nbinsx=60, histnorm='probability density'),
-                      row=1, col=1)
-        fig.add_trace(go.Box(y=sub, name=labels[label], marker_color=colors[label],
-                             boxmean=True), row=1, col=2)
-    fig.update_layout(paper_bgcolor='#0d1117', plot_bgcolor='#161b22',
-                      font_color='#c9d1d9', title_text='Transaction Amount Analysis',
-                      barmode='overlay', height=380)
-    return fig
-
-
-def plot_fraud_rate_by_cat(df: pd.DataFrame, col: str) -> go.Figure:
-    agg = (df.groupby(col)['isFraud'].agg(['mean', 'count']).reset_index()
-           .rename(columns={'mean': 'fraud_rate', 'count': 'total'}))
-    agg['fraud_rate_pct'] = (agg['fraud_rate'] * 100).round(2)
-    agg = agg.sort_values('fraud_rate_pct', ascending=False).head(15)
-    fig = px.bar(agg, x=col, y='fraud_rate_pct', text='fraud_rate_pct',
-                 color='fraud_rate_pct',
-                 color_continuous_scale=['#3fb950', '#d2993a', '#f85149'],
-                 title=f'Fraud Rate (%) by {col}',
-                 labels={'fraud_rate_pct': 'Fraud Rate (%)'})
-    fig.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
-    fig.update_layout(paper_bgcolor='#0d1117', plot_bgcolor='#161b22',
-                      font_color='#c9d1d9', coloraxis_showscale=False,
-                      height=380, title_font_size=14)
-    return fig
-
-
-def plot_correlation_heatmap(df: pd.DataFrame) -> go.Figure:
-    num_cols  = ['TransactionAmt', 'C1', 'C2', 'C6', 'C11', 'C13',
-                 'D1', 'D4', 'D10', 'card1', 'addr1', 'isFraud']
-    available = [c for c in num_cols if c in df.columns]
-    corr = df[available].corr(numeric_only=True)
-    fig  = go.Figure(go.Heatmap(z=corr.values, x=corr.columns.tolist(),
-                                y=corr.index.tolist(), colorscale='RdBu', zmid=0,
-                                text=np.round(corr.values, 2), texttemplate='%{text}',
-                                textfont_size=9))
-    fig.update_layout(title='Feature Correlation Matrix', paper_bgcolor='#0d1117',
-                      plot_bgcolor='#0d1117', font_color='#c9d1d9', height=420)
-    return fig
-
-
-def plot_hourly_fraud(df: pd.DataFrame) -> go.Figure:
-    if 'tx_hour' not in df.columns:
-        df = df.copy()
-        df['tx_hour'] = ((df.get('TransactionDT', 0) / 3600) % 24).astype(int)
-    agg = df.groupby('tx_hour')['isFraud'].agg(['mean', 'count']).reset_index()
-    agg['fraud_rate_pct'] = (agg['mean'] * 100).round(2)
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Bar(x=agg['tx_hour'], y=agg['count'], name='Total Transactions',
-                         marker_color='#1f6feb', opacity=0.5), secondary_y=False)
-    fig.add_trace(go.Scatter(x=agg['tx_hour'], y=agg['fraud_rate_pct'],
-                             name='Fraud Rate (%)', mode='lines+markers',
-                             line=dict(color='#f85149', width=2), marker=dict(size=6)),
-                  secondary_y=True)
-    fig.update_layout(title='Fraud Rate & Volume by Hour of Day', paper_bgcolor='#0d1117',
-                      plot_bgcolor='#161b22', font_color='#c9d1d9', height=360)
-    fig.update_yaxes(title_text='Transaction Count', secondary_y=False)
-    fig.update_yaxes(title_text='Fraud Rate (%)', secondary_y=True)
-    return fig
-
-
-with tab_eda:
+elif page == "EDA Analytics":
     st.markdown("## Exploratory Data Analysis")
 
     eda_uploaded = st.file_uploader(
@@ -692,7 +830,7 @@ with tab_eda:
 
     st.markdown("---")
     st.markdown("### 3️⃣ Fraud Rate by Categorical Features")
-    cat_choice = st.selectbox("Chọn feature",
+    cat_choice = st.selectbox("SELECT feature",
         [c for c in ['ProductCD','card4','card6','P_emaildomain','DeviceType'] if c in df_eda.columns])
     st.plotly_chart(plot_fraud_rate_by_cat(df_eda, cat_choice), use_container_width=True)
 
@@ -717,3 +855,45 @@ with tab_eda:
         )
         fig_c1.update_layout(paper_bgcolor='#0d1117', plot_bgcolor='#161b22', font_color='#c9d1d9')
         st.plotly_chart(fig_c1, use_container_width=True)
+
+elif page == "Settings":
+    st.markdown("### ⚙️ System Configuration")
+
+    st.info("💡 You can upload a new file or leave it blank to use the default file set.")
+
+    # File Uploaders
+    up_model = st.file_uploader("Update Model (.ubj)", type=['ubj'])
+
+    st.write("---")
+    st.session_state['threshold'] = st.slider(
+        "Fraud Threshold (Global)", 
+        min_value=0.1, 
+        max_value=0.9, 
+        value=st.session_state['threshold'], 
+        step=0.05,
+        help="This threshold will be applied to all predictions in the system."
+    )
+
+    if st.button("🔄 Sync & Refresh Assets", use_container_width=True, type="primary"):
+        # Default Hardcoded Paths
+        DEF_M = "./best_xgb_model/best_booster_sample.ubj"
+        DEF_U = "./artifacts/uid_agg_sample.parquet"
+        DEF_F = "./artifacts/freq_maps_sample.pkl"
+
+        # 1. Sync Model
+        try:
+            if up_model is not None:
+                with open("temp_model.ubj", "wb") as f:
+                    f.write(up_model.getbuffer())
+                st.session_state['booster'] = load_model("temp_model.ubj")
+                st.session_state['uid_agg'] = load_uid_agg(DEF_U)
+                st.session_state['freq_maps'] = load_freq_maps(DEF_F)
+                st.success("✅ New Model Loaded!")
+            else:
+                st.session_state['booster'] = load_model(DEF_M)
+                st.session_state['uid_agg'] = load_uid_agg(DEF_U)
+                st.session_state['freq_maps'] = load_freq_maps(DEF_F)
+                st.success("ℹ️ Default Model Synced.")
+        except Exception as e: st.error(f"Model Error: {e}")
+
+ 
