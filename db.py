@@ -10,11 +10,12 @@ def init_db():
     """Khởi tạo bảng cases nếu chưa tồn tại"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # Thêm các cột metadata (card1, addr1, email) để phục vụ Network Graph sau này
+    # Tạo bảng với cột amount
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS cases (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             transaction_id TEXT,
+            amount REAL,
             probability REAL,
             prediction_label TEXT,
             card1 TEXT,
@@ -26,6 +27,13 @@ def init_db():
             notes TEXT
         )
     ''')
+    
+    # Logic migration: Kiểm tra xem cột amount đã có chưa (cho các DB cũ)
+    cursor.execute("PRAGMA table_info(cases)")
+    columns = [info[1] for info in cursor.fetchall()]
+    if 'amount' not in columns:
+        cursor.execute("ALTER TABLE cases ADD COLUMN amount REAL")
+        
     conn.commit()
     conn.close()
 
@@ -38,7 +46,7 @@ def is_transaction_logged(transaction_id):
     conn.close()
     return exists
 
-def save_case(transaction_id, probability, prediction_label, card1="", addr1="", email="", investigator="System"):
+def save_case(transaction_id, amount, probability, prediction_label, card1="", addr1="", email="", investigator="System", status="Pending"):
     """Lưu một ca điều tra mới với dữ liệu quan hệ, kiểm tra trùng lặp"""
     if is_transaction_logged(transaction_id):
         return False
@@ -46,9 +54,9 @@ def save_case(transaction_id, probability, prediction_label, card1="", addr1="",
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO cases (transaction_id, probability, prediction_label, card1, addr1, email, investigator)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (str(transaction_id), float(probability), prediction_label, str(card1), str(addr1), str(email), investigator))
+        INSERT INTO cases (transaction_id, amount, probability, prediction_label, card1, addr1, email, investigator, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (str(transaction_id), float(amount), float(probability), prediction_label, str(card1), str(addr1), str(email), investigator, status))
     conn.commit()
     conn.close()
     return True

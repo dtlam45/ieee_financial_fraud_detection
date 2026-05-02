@@ -268,6 +268,60 @@ def predict(booster: xgb.Booster, X: pd.DataFrame) -> np.ndarray:
     return booster.predict(dmat)
 
 
+def update_uid_stats(new_rows_df: pd.DataFrame, uid_agg: pd.DataFrame) -> pd.DataFrame:
+    """
+    Cập nhật dữ liệu tổng hợp (uid_agg) từ giao dịch mới và lưu lại bản 'live'.
+    """
+    uid_agg = uid_agg.copy()
+    live_path = "./artifacts/uid_agg_live.parquet"
+    
+    # Đảm bảo có cột uid để tra cứu
+    if 'uid' not in new_rows_df.columns:
+        new_rows_df = add_uid(new_rows_df)
+        
+    for _, row in new_rows_df.iterrows():
+        uid = str(row['uid'])
+        amt = float(row.get('TransactionAmt', 0))
+        d10 = float(row.get('D10', 0)) if not pd.isna(row.get('D10')) else 0.0
+        c1  = float(row.get('C1', 0)) if not pd.isna(row.get('C1')) else 0.0
+        
+        if uid in uid_agg['uid'].values:
+            idx = uid_agg.index[uid_agg['uid'] == uid][0]
+            n = uid_agg.at[idx, 'uid_tx_count']
+            
+            # Cập nhật các chỉ số trung bình (Online Mean)
+            uid_agg.at[idx, 'uid_amt_mean'] = (uid_agg.at[idx, 'uid_amt_mean'] * n + amt) / (n + 1)
+            uid_agg.at[idx, 'uid_D10_mean'] = (uid_agg.at[idx, 'uid_D10_mean'] * n + d10) / (n + 1)
+            uid_agg.at[idx, 'uid_C1_mean']  = (uid_agg.at[idx, 'uid_C1_mean'] * n + c1) / (n + 1)
+            
+            # Cập nhật Min/Max
+            uid_agg.at[idx, 'uid_amt_max'] = max(uid_agg.at[idx, 'uid_amt_max'], amt)
+            uid_agg.at[idx, 'uid_amt_min'] = min(uid_agg.at[idx, 'uid_amt_min'], amt)
+            
+            # Tăng số lượng giao dịch
+            uid_agg.at[idx, 'uid_tx_count'] = n + 1
+        else:
+            # Nếu là khách hàng hoàn toàn mới
+            new_record = {
+                'uid': uid, 'uid_tx_count': 1,
+                'uid_amt_mean': amt, 'uid_amt_std': 0.0,
+                'uid_amt_max': amt, 'uid_amt_min': amt,
+                'uid_D10_mean': d10, 'uid_C1_mean': c1
+            }
+            uid_agg = pd.concat([uid_agg, pd.DataFrame([new_record])], ignore_index=True)
+    
+    # Lưu xuống file để duy trì trạng thái sau khi tắt app
+    try:
+        if not os.path.exists("./artifacts"):
+            os.makedirs("./artifacts")
+        uid_agg.to_parquet(live_path)
+    except Exception as e:
+        print(f"Error saving live UID stats: {e}")
+        
+    return uid_agg
+
+
+
 _EMAIL_RISK  = {'anonymous.com': 0.82, 'unknown.xyz': 0.76, 'protonmail.com': 0.32,
                 'yahoo.com': 0.15, 'gmail.com': 0.07, 'hotmail.com': 0.10, 'other': 0.18}
 _PRODUCT_RISK = {'C': 0.68, 'H': 0.42, 'R': 0.28, 'S': 0.20, 'W': 0.14}
@@ -410,33 +464,125 @@ if page == "Dashboard":
     st.markdown("# Executive Fraud Dashboard")
     st.markdown("Real-time risk insights from aggregated transaction history.")
     
-    # Load data for dashboard
+    # ─── LIVE PRODUCTION METRICS (from sentinel.db) ──────────────────────────
+    st.subheader("🚀 Live Production Monitoring")
+    df_cases = get_all_cases()
+    threshold = st.session_state.get('threshold', 0.5)
+    
+    if not df_cases.empty:
+        # Calculate live metrics
+        total_cases = len(df_cases)
+        high_risk_cases = len(df_cases[df_cases['probability'] >= threshold])
+        confirmed_fraud = len(df_cases[df_cases['status'] == 'Confirmed Fraud'])
+        pending_cases = len(df_cases[df_cases['status'] == 'Pending'])
+        
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total Scanned", f"{total_cases:,}")
+        m2.metric("High Risk Detected", f"{high_risk_cases:,}", 
+                  delta=f"{high_risk_cases/total_cases*100:.1f}% Risk Rate", delta_color="inverse")
+        
+        # Calculate accuracy/precision if there are confirmed labels
+        confirmed_total = len(df_cases[df_cases['status'].isin(['Confirmed Fraud', 'Confirmed Legit'])])
+        if confirmed_total > 0:
+            precision = (confirmed_fraud / confirmed_total * 100)
+            m3.metric("Confirmed Fraud", f"{confirmed_fraud:,}", delta=f"{precision:.1f}% Prec.")
+        else:
+            m3.metric("Confirmed Fraud", f"{confirmed_fraud:,}", delta="No Labels Yet")
+            
+        m4.metric("Pending Review", f"{pending_cases:,}")
+        
+        col_l, col_r = st.columns(2)
+        with col_l:
+            # Probability Distribution
+            fig_prob = px.histogram(
+                df_cases, x='probability', 
+                title="Risk Probability Distribution (Live)",
+                template="plotly_dark", 
+                color_discrete_sequence=['#f85149'],
+                nbins=30
+            )
+            fig_prob.add_vline(x=threshold, line_dash="dash", line_color="white", annotation_text="Threshold")
+            st.plotly_chart(fig_prob, use_container_width=True)
+            
+        with col_r:
+            # Status Breakdown
+            status_counts = df_cases['status'].value_counts().reset_index()
+            status_counts.columns = ['Status', 'Count']
+            fig_status = px.pie(
+                status_counts, values='Count', names='Status',
+                title="Investigation Status Breakdown",
+                template="plotly_dark",
+                hole=0.4,
+                color_discrete_sequence=px.colors.qualitative.Safe
+            )
+            st.plotly_chart(fig_status, use_container_width=True)
+            
+        # Top Risk Entities
+        st.markdown("### 🔍 Top High-Risk Entities")
+        high_risk_df = df_cases[df_cases['probability'] >= threshold]
+        if not high_risk_df.empty:
+            c_entity1, c_entity2 = st.columns(2)
+            with c_entity1:
+                risk_cards = high_risk_df.groupby('card1').size().reset_index(name='fraud_count')
+                risk_cards = risk_cards.sort_values('fraud_count', ascending=False).head(10)
+                fig_cards = px.bar(
+                    risk_cards, x='card1', y='fraud_count',
+                    title="Top 10 High-Risk Card1 IDs",
+                    template="plotly_dark",
+                    color='fraud_count',
+                    color_continuous_scale='Reds'
+                )
+                st.plotly_chart(fig_cards, use_container_width=True)
+            
+            with c_entity2:
+                risk_emails = high_risk_df.groupby('email').size().reset_index(name='fraud_count')
+                risk_emails = risk_emails.sort_values('fraud_count', ascending=False).head(10)
+                risk_emails['email'] = risk_emails['email'].replace('', 'Unknown')
+                fig_emails = px.bar(
+                    risk_emails, x='email', y='fraud_count',
+                    title="Top 10 High-Risk Emails",
+                    template="plotly_dark",
+                    color='fraud_count',
+                    color_continuous_scale='Oranges'
+                )
+                st.plotly_chart(fig_emails, use_container_width=True)
+    else:
+        st.info("No live prediction data found in sentinel.db. Statistics will appear here after you run predictions.")
+
+    st.write("---")
+    
+    # ─── HISTORICAL BASELINE (from parquet) ──────────────────────────────────
+    st.subheader("📊 Historical Baseline (Training Set)")
     uid_df = st.session_state.get('uid_agg')
-    if uid_df is None and os.path.exists("./artifacts/uid_agg_sample.parquet"):
-        uid_df = load_uid_agg("./artifacts/uid_agg_sample.parquet")
+    if uid_df is None:
+        live_p = "./artifacts/uid_agg_live.parquet"
+        sample_p = "./artifacts/uid_agg_sample.parquet"
+        if os.path.exists(live_p):
+            uid_df = load_uid_agg(live_p)
+        elif os.path.exists(sample_p):
+            uid_df = load_uid_agg(sample_p)
         st.session_state['uid_agg'] = uid_df
 
     if uid_df is not None:
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Transactions", f"{uid_df['uid_tx_count'].sum():,}", "+5.2%")
-        c2.metric("Tracked Entities", f"{len(uid_df):,}", "+1.8%")
-        c3.metric("Avg Exposure", f"${uid_df['uid_amt_mean'].mean():.2f}", "-0.4%")
-        c4.metric("High Risk Users", f"{len(uid_df[uid_df['uid_amt_mean'] > 500]):,}", "Critical")
-        
-        st.write("---")
+        c1.metric("Training Transactions", f"{uid_df['uid_tx_count'].sum():,}")
+        c2.metric("Unique Entities", f"{len(uid_df):,}")
+        c3.metric("Avg Training Amt", f"${uid_df['uid_amt_mean'].mean():.2f}")
+        c4.metric("Baseline Risk Users", f"{len(uid_df[uid_df['uid_amt_mean'] > 500]):,}")
         
         col_left, col_right = st.columns(2)
         with col_left:
-            fig_vol = px.histogram(uid_df, x='uid_tx_count', title="User Activity Distribution (Volume)", 
+            fig_vol = px.histogram(uid_df, x='uid_tx_count', title="Training Activity Distribution (Volume)", 
                                    template="plotly_dark", color_discrete_sequence=['#2563eb'])
-            st.plotly_chart(fig_vol, use_container_width=True) # width='stretch' in new API
+            st.plotly_chart(fig_vol, use_container_width=True)
             
         with col_right:
-            fig_amt = px.box(uid_df, y='uid_amt_mean', title="Transaction Amount Spread per UID", 
+            fig_amt = px.box(uid_df, y='uid_amt_mean', title="Training Amt Spread per UID", 
                              template="plotly_dark", color_discrete_sequence=['#f85149'])
             st.plotly_chart(fig_amt, use_container_width=True)
     else:
-        st.warning("Please sync 'UID Agg' in the sidebar to view Dashboard stats.")
+        st.warning("Historical baseline artifacts not found.")
+
 
 elif page == "Investigation Center":
     st.markdown("# 🛡️ Investigation Center")
@@ -453,7 +599,6 @@ elif page == "Investigation Center":
         c2.metric("❌ Fraud", len(df_cases[df_cases['status'] == 'Confirmed Fraud']))
         c3.metric("✅ Legit", len(df_cases[df_cases['status'] == 'Confirmed Legit']))
         c4.metric("⏳ Pending", len(df_cases[df_cases['status'] == 'Pending']))
-
         st.write("---")
         
         # Dashboard Table with Status Update
@@ -579,28 +724,36 @@ elif page == "Predict":
                     X          = run_full_pipeline(df_input, uid_agg, freq_maps, booster)
                     prob       = float(predict(booster, X)[0])
                     mode_label = "XGBoost Model"
+                    
+                    # ── FEEDBACK LOOP: Cập nhật dữ liệu lịch sử ngay lập tức ──
+                    st.session_state['uid_agg'] = update_uid_stats(df_input, uid_agg)
+                    
                 else:
                     prob       = demo_predict({**input_row, 'P_emaildomain': p_email, 'tx_hour': tx_hour})
                     mode_label = "Demo Mode (heuristic)"
                 
-                # ── AUTOMATIC SAVE TO INVESTIGATION ──
-                if prob >= threshold:
-                    # Generate a fake but unique TransactionID for single predict
-                    txn_id = f"SING-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                    investigator = st.session_state.get("username", "System")
-                    label = "Fraud" if prob >= threshold else "Legit" # though here it's always >= threshold
-                    
-                    saved = save_case(
-                        transaction_id=txn_id,
-                        probability=prob,
-                        prediction_label=label,
-                        card1=card1,
-                        addr1=addr1,
-                        email=p_email,
-                        investigator=investigator
-                    )
-                    if saved:
+                # ── AUTOMATIC SAVE TO DATABASE (Log all transactions) ──
+                txn_id = f"SING-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                investigator = st.session_state.get("username", "System")
+                is_fraud = prob >= threshold
+                label = "Fraud" if is_fraud else "Legit"
+                initial_status = "Pending" if is_fraud else "Confirmed Legit"
+                
+                saved = save_case(
+                    transaction_id=txn_id,
+                    probability=prob,
+                    prediction_label=label,
+                    card1=card1,
+                    addr1=addr1,
+                    email=p_email,
+                    investigator=investigator,
+                    status=initial_status
+                )
+                if saved:
+                    if is_fraud:
                         st.toast(f"🚨 Fraud case logged: {txn_id}", icon="🛡️")
+                    else:
+                        st.toast(f"✅ Transaction logged: {txn_id}", icon="📊")
             except Exception as e:
                 st.error(f"Pipeline error: {e}")
                 import traceback; st.code(traceback.format_exc())
@@ -649,8 +802,7 @@ elif page == "Predict":
 elif page == "Batch Scoring":
     st.markdown("## Batch Scoring")
     st.markdown(
-        "Upload the CSV file (in the same format as IEEE-CIS's `test_transaction.csv`)."
-        "The app will run the **correct** pipeline as in the notebook and return a fraud probability."
+        "Diagnose fraud risk by uploading a CSV file. The application performs feature analysis and returns a real-time risk probability index."
     )
 
     uploaded = st.file_uploader(
@@ -676,6 +828,9 @@ elif page == "Batch Scoring":
                         # ── BUG FIX: dùng run_full_pipeline mới lấy features từ booster ──
                         X_batch = run_full_pipeline(df_up.copy(), uid_agg, freq_maps, booster)
                         probs   = predict(booster, X_batch)
+                        
+                        # ── FEEDBACK LOOP: Cập nhật lịch sử cho toàn bộ lô giao dịch ──
+                        st.session_state['uid_agg'] = update_uid_stats(df_up, uid_agg)
 
                     else:
                         # Demo mode
@@ -695,27 +850,32 @@ elif page == "Batch Scoring":
                     df_result['prediction']        = (probs >= threshold).astype(int)
                     df_result['label']             = df_result['prediction'].map({0: 'Legit', 1: 'Fraud'})
 
-                    # ── AUTOMATIC SAVE BATCH FRAUD CASES ──
-                    fraud_rows = df_result[df_result['prediction'] == 1]
+                    # ── AUTOMATIC SAVE ALL BATCH TRANSACTIONS ──
                     investigator = st.session_state.get("username", "System")
-                    
                     new_logs_count = 0
-                    for index, row in fraud_rows.iterrows():
-                        # Lấy thêm thông tin từ df_up gốc để lưu
+                    fraud_count = 0
+                    
+                    for index, row in df_result.iterrows():
                         orig_row = df_up.iloc[index]
+                        is_fraud = row['prediction'] == 1
+                        initial_status = "Pending" if is_fraud else "Confirmed Legit"
+                        
                         saved = save_case(
                             transaction_id=row[id_col],
                             probability=row['fraud_probability'],
-                            prediction_label="Fraud",
+                            prediction_label=row['label'],
                             card1=orig_row.get('card1', ''),
                             addr1=orig_row.get('addr1', ''),
                             email=orig_row.get('P_emaildomain', ''),
-                            investigator=investigator
+                            investigator=investigator,
+                            status=initial_status
                         )
-                        if saved: new_logs_count += 1
-                        
+                        if saved:
+                            new_logs_count += 1
+                            if is_fraud: fraud_count += 1
+                            
                     if new_logs_count > 0:
-                        st.toast(f"✅ Logged {new_logs_count} new fraud cases to Investigation Center", icon="🛡️")
+                        st.toast(f"✅ Processed {new_logs_count} transactions ({fraud_count} high risk)", icon="📊")
 
 
                     n_fraud = int((probs >= threshold).sum())
@@ -882,18 +1042,21 @@ elif page == "Settings":
 
         # 1. Sync Model
         try:
+            live_u = "./artifacts/uid_agg_live.parquet"
+            u_path = live_u if os.path.exists(live_u) else DEF_U
+
             if up_model is not None:
                 with open("temp_model.ubj", "wb") as f:
                     f.write(up_model.getbuffer())
                 st.session_state['booster'] = load_model("temp_model.ubj")
-                st.session_state['uid_agg'] = load_uid_agg(DEF_U)
+                st.session_state['uid_agg'] = load_uid_agg(u_path)
                 st.session_state['freq_maps'] = load_freq_maps(DEF_F)
-                st.success("✅ New Model Loaded!")
+                st.success("✅ New Model & Latest UID Stats Loaded!")
             else:
                 st.session_state['booster'] = load_model(DEF_M)
-                st.session_state['uid_agg'] = load_uid_agg(DEF_U)
+                st.session_state['uid_agg'] = load_uid_agg(u_path)
                 st.session_state['freq_maps'] = load_freq_maps(DEF_F)
-                st.success("ℹ️ Default Model Synced.")
+                st.success(f"ℹ️ Default Assets Synced (Source: {'Live' if u_path == live_u else 'Sample'}).")
         except Exception as e: st.error(f"Model Error: {e}")
 
  
