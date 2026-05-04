@@ -617,6 +617,7 @@ elif page == "Investigation Center":
             use_container_width=True,
             column_config={
                 "id": "#ID",
+                "amount": st.column_config.NumberColumn("Số tiền", format="$%.2f"),
                 "probability": st.column_config.ProgressColumn("Xác suất Fraud", min_value=0, max_value=1),
                 "created_at": "Thời gian tạo",
                 "status": "Trạng thái",
@@ -632,8 +633,7 @@ elif page == "Investigation Center":
             file_name=f"sentinel_investigation_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime='text/csv',
             use_container_width=True,
-            type="secondary",
-            help="Xuất danh sách các hồ sơ đang hiển thị trong bộ lọc hiện tại."
+            type="secondary"
         )
 
         st.write("---")
@@ -741,6 +741,7 @@ elif page == "Predict":
                 
                 saved = save_case(
                     transaction_id=txn_id,
+                    amount=tx_amt,
                     probability=prob,
                     prediction_label=label,
                     card1=card1,
@@ -824,24 +825,12 @@ elif page == "Batch Scoring":
 
             with st.spinner(f"Scoring {len(df_up):,} transactions..."):
                 try:
-                    if booster is not None and uid_agg is not None and freq_maps is not None:
-                        # ── BUG FIX: dùng run_full_pipeline mới lấy features từ booster ──
-                        X_batch = run_full_pipeline(df_up.copy(), uid_agg, freq_maps, booster)
-                        probs   = predict(booster, X_batch)
-                        
-                        # ── FEEDBACK LOOP: Cập nhật lịch sử cho toàn bộ lô giao dịch ──
-                        st.session_state['uid_agg'] = update_uid_stats(df_up, uid_agg)
-
-                    else:
-                        # Demo mode
-                        prog  = st.progress(0)
-                        probs = []
-                        for i, (_, row) in enumerate(df_up.iterrows()):
-                            probs.append(demo_predict(row.to_dict()))
-                            if i % max(1, len(df_up) // 20) == 0:
-                                prog.progress(min(i / len(df_up), 1.0))
-                        probs = np.array(probs)
-                        st.info("⚠ Demo mode — load artifacts to use the real model")
+                    # ── BUG FIX: dùng run_full_pipeline mới lấy features từ booster ──
+                    X_batch = run_full_pipeline(df_up.copy(), uid_agg, freq_maps, booster)
+                    probs   = predict(booster, X_batch)
+                    
+                    # ── FEEDBACK LOOP: Cập nhật lịch sử cho toàn bộ lô giao dịch ──
+                    st.session_state['uid_agg'] = update_uid_stats(df_up, uid_agg)
 
                     id_col    = 'TransactionID' if 'TransactionID' in df_up.columns else df_up.columns[0]
                     df_result = df_up[[id_col]].copy()
@@ -862,6 +851,7 @@ elif page == "Batch Scoring":
                         
                         saved = save_case(
                             transaction_id=row[id_col],
+                            amount=orig_row.get('TransactionAmt', 0),
                             probability=row['fraud_probability'],
                             prediction_label=row['label'],
                             card1=orig_row.get('card1', ''),
@@ -1051,7 +1041,7 @@ elif page == "Settings":
                 st.session_state['booster'] = load_model("temp_model.ubj")
                 st.session_state['uid_agg'] = load_uid_agg(u_path)
                 st.session_state['freq_maps'] = load_freq_maps(DEF_F)
-                st.success("✅ New Model & Latest UID Stats Loaded!")
+                st.success("✅ New Model Loaded!")
             else:
                 st.session_state['booster'] = load_model(DEF_M)
                 st.session_state['uid_agg'] = load_uid_agg(u_path)
